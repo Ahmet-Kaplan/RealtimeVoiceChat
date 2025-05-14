@@ -4,6 +4,16 @@ FROM nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04 AS builder
 # Avoid prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
 
+RUN apt-get update && apt-get install -y openssh-server && \
+    mkdir /var/run/sshd && \
+    echo "root:dockerpass" | chpasswd && \
+    sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config && \
+    sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config && \
+    sed -i 's/UsePAM yes/UsePAM no/' /etc/ssh/sshd_config
+
+EXPOSE 22
+EXPOSE 8000
+
 # Install Python 3.10, pip, build essentials, git, and other system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.10 \
