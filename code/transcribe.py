@@ -405,21 +405,20 @@ class TranscriptionProcessor:
         on previously detected potential sentence ends, useful if processing needs
         to be reset or interrupted externally.
         """
-        logger.info("🎙️ STT abort_generation called.")
-        self._is_aborted = True # Set flag to signal loops/feed_audio
+        logger.info("🎙️ STT abort_generation called.") # 1.a
+        self._is_aborted = True # 1.b: Set early
 
-        if self.recorder:
-            logger.debug("🎙️ Calling self.recorder.abort_generation() for underlying STT engine.")
-            self.recorder.abort_generation()
-            # We are not setting self.recorder = None here.
-            # It will be None only after shutdown() or if _create_recorder fails.
-            # Or, if we want a full reset: self.recorder.shutdown(); self.recorder = None;
-
-        if self.transcription_future and not self.transcription_future.done():
+        if self.transcription_future and not self.transcription_future.done(): # 1.c
             logger.debug("🎙️ Cancelling transcription_future in abort_generation.")
             self.transcription_future.cancel()
-        # Do NOT call _create_recorder() here. It will be called by feed_audio if needed.
-        logger.info("🎙️ STT generation aborted. Recorder will be re-created on next feed_audio if needed.")
+
+        if self.recorder: # 1.d
+            logger.debug("🎙️ Calling self.recorder.shutdown() for underlying STT engine.")
+            self.recorder.shutdown()
+            self.recorder = None # 1.e
+            logger.debug("🎙️ Recorder shut down and set to None.")
+        # 1.f: Removed log about re-creation on next feed_audio, as it's now certain.
+        # The re-creation will be handled by feed_audio or ensure_recorder_ready finding recorder is None.
 
     def ensure_recorder_ready(self):
         logger.debug("🎙️ Attempting to ensure recorder is ready for new session...")

@@ -620,6 +620,8 @@ class TranscriptionCallbacks:
         self.last_inferred_transcription: str = ""
         self.final_assistant_answer_sent: bool = False
         self.partial_transcription: str = "" # Added for clarity
+        self.user_speech_started_sent_for_session: bool = False # 1.a
+        self.vad_triggered_event: Optional[asyncio.Event] = None # 1.a
 
         self.reset_state() # Call reset to ensure consistency
 
@@ -627,12 +629,18 @@ class TranscriptionCallbacks:
         self.abort_worker_thread = threading.Thread(target=self._abort_worker, name="AbortWorker", daemon=True)
         self.abort_worker_thread.start()
 
-    def on_user_speech_started(self):
+    def on_user_speech_started(self): # 1.c
         """Callback invoked when user speech is detected by AudioInputProcessor's chain."""
-        logger.info(f"🎤 {Colors.GREEN}User speech started signal received. Notifying client.{Colors.RESET}")
+        if self.user_speech_started_sent_for_session:
+            logger.debug("🎤 User speech started signal already sent for this session (VAD triggered).")
+            return
+        self.user_speech_started_sent_for_session = True
+        if self.vad_triggered_event:
+            self.vad_triggered_event.set()
+        logger.info(f"🎤 {Colors.GREEN}User speech started signal received (VAD triggered). Notifying client.{Colors.RESET}")
         self.message_queue.put_nowait({"type": "user_speech_started"})
 
-    def reset_state(self):
+    def reset_state(self): # 1.b
         """Resets connection-specific state flags and variables to their initial values."""
         # Reset all connection-specific state flags
         self.tts_to_client = False
@@ -653,6 +661,10 @@ class TranscriptionCallbacks:
         self.last_inferred_transcription = ""
         self.final_assistant_answer_sent = False
         self.partial_transcription = ""
+        self.user_speech_started_sent_for_session = False # 1.b
+        if self.vad_triggered_event: # 1.b (modified to clear, as per good practice)
+            self.vad_triggered_event.clear()
+
 
         # Keep the abort call related to the audio processor/pipeline manager
         self.app.state.AudioInputProcessor.abort_generation()
@@ -963,6 +975,8 @@ async def websocket_endpoint(ws: WebSocket):
 
     # Set up callback manager - THIS NOW HOLDS THE CONNECTION-SPECIFIC STATE
     callbacks = TranscriptionCallbacks(app, message_queue)
+    vad_triggered_event = asyncio.Event() # 2.a
+    callbacks.vad_triggered_event = vad_triggered_event # 2.a
 
     # Set all active listeners for the AudioInputProcessor to methods from the current 'callbacks' instance
     if hasattr(app.state, "AudioInputProcessor") and app.state.AudioInputProcessor:
@@ -987,14 +1001,39 @@ async def websocket_endpoint(ws: WebSocket):
     # Assign callback to the SpeechPipelineManager (global component)
     app.state.SpeechPipelineManager.on_partial_assistant_text = callbacks.on_partial_assistant_text
 
+    # Define the proactive signal sender function (2.b)
+    async def send_proactive_user_speech_started_signal(callbacks_ref: TranscriptionCallbacks, mq_ref: asyncio.Queue, vad_event_ref: asyncio.Event, timeout_seconds: float):
+        try:
+            await asyncio.wait_for(vad_event_ref.wait(), timeout=timeout_seconds)
+            logger.info("🗣️ VAD triggered `user_speech_started` before proactive signal timeout.")
+        except asyncio.TimeoutError:
+            if not callbacks_ref.user_speech_started_sent_for_session:
+                logger.info("🗣️ Proactive signal timeout: VAD did not trigger. Sending `user_speech_started` proactively.")
+                callbacks_ref.user_speech_started_sent_for_session = True # Mark as sent
+                # Use put_nowait as send_text_messages will handle actual send
+                mq_ref.put_nowait({"type": "user_speech_started"})
+            else:
+                logger.info("🗣️ Proactive signal timeout: VAD did not trigger, but signal was already sent (race condition).")
+        except Exception as e:
+            logger.error(f"🗣️ Error in proactive_signal_task: {e}", exc_info=True)
+
     # Create tasks for handling different responsibilities
     # Pass the 'callbacks' instance to tasks that need connection-specific state
-    tasks = [
-        asyncio.create_task(process_incoming_data(ws, app, audio_chunks, callbacks)), # Pass callbacks
-        asyncio.create_task(app.state.AudioInputProcessor.process_chunk_queue(audio_chunks)),
-        asyncio.create_task(send_text_messages(ws, message_queue)),
-        asyncio.create_task(send_tts_chunks(app, message_queue, callbacks)), # Pass callbacks
-    ]
+    # Use a set for tasks to easily add the new proactive_signal_task
+    tasks = { # Changed from list to set
+        asyncio.create_task(process_incoming_data(ws, app, audio_chunks, callbacks), name="process_incoming_data"),
+        asyncio.create_task(app.state.AudioInputProcessor.process_chunk_queue(audio_chunks), name="process_chunk_queue"),
+        asyncio.create_task(send_text_messages(ws, message_queue), name="send_text_messages"),
+        asyncio.create_task(send_tts_chunks(app, message_queue, callbacks), name="send_tts_chunks"),
+    }
+
+    # Create and add the proactive signal task (2.c)
+    # Using locals for callbacks, message_queue, vad_triggered_event to ensure correct references
+    proactive_signal_task = asyncio.create_task(
+        send_proactive_user_speech_started_signal(callbacks, message_queue, vad_triggered_event, 0.5), # 0.5 second timeout
+        name="proactive_signal"
+    )
+    tasks.add(proactive_signal_task)
 
     try:
         # Wait for any task to complete (e.g., client disconnect)
@@ -1019,6 +1058,12 @@ async def websocket_endpoint(ws: WebSocket):
         if hasattr(app.state, "AudioInputProcessor") and app.state.AudioInputProcessor:
             logger.info("🖥️🧹 Clearing all active listeners in AudioInputProcessor for closed connection.")
             app.state.AudioInputProcessor.clear_active_listeners()
+
+        # Ensure proactive_signal_task is handled in cleanup (2.d)
+        # The existing loop `for task in pending: task.cancel()` should handle it if it was added to `tasks` set.
+        # If proactive_signal_task might finish early and not be in `pending`, explicit check is fine too,
+        # but asyncio.wait's `pending` list should include all tasks not in `done`.
+        # The current logic for cancelling tasks in `pending` is sufficient.
 
 # --------------------------------------------------------------------
 # Entry point
