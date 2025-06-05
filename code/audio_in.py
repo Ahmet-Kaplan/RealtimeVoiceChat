@@ -56,7 +56,7 @@ class AudioInputProcessor:
         self.active_silence_active_callback: Optional[Callable[[bool], None]] = None
 
         self.transcriber = TranscriptionProcessor(
-            language=language,
+            source_language=language, # Corrected keyword argument
             # Callbacks for TranscriptionProcessor are internal methods of AudioInputProcessor
             realtime_transcription_callback=self._internal_on_partial,
             full_transcription_callback=self._internal_on_final,
