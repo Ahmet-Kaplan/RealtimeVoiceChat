@@ -1,4 +1,5 @@
 import logging
+import asyncio # Added import
 logger = logging.getLogger(__name__)
 
 from turndetect import strip_ending_punctuation
