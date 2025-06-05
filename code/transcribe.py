@@ -154,7 +154,10 @@ class TranscriptionProcessor:
         self.potential_sentences_yielded: List[Dict[str, Any]] = []
         self.stripped_partial_user_text: str = ""
         self.final_transcription: Optional[str] = None
-        self.shutdown_performed: bool = False
+        self.shutdown_performed: bool = False # Should be set in shutdown()
+        self.transcription_future: Optional[asyncio.Future] = None
+        self.recorder: Optional[AudioToTextRecorder | AudioToTextRecorderClient] = None
+        self._is_aborted: bool = True # Start in aborted state
         self.silence_time: float = 0.0
         self.silence_active: bool = False
         self.last_audio_copy: Optional[np.ndarray] = None
@@ -175,7 +178,7 @@ class TranscriptionProcessor:
                 pipeline_latency=pipeline_latency
             )
 
-        self._create_recorder()
+        # self._create_recorder() # Recorder will be created lazily by feed_audio
         self._start_silence_monitor()
 
     # --- Recorder Parameter Abstraction ---
@@ -353,9 +356,18 @@ class TranscriptionProcessor:
         registers this callback with the recorder instance.
         """
         def on_final(text: Optional[str]):
+            # At the beginning of transcribe_loop, check _is_aborted
+            if self._is_aborted:
+                logger.info("🎙️ transcribe_loop: exiting immediately due to _is_aborted flag being True.")
+                return
+
             if text is None or text == "":
                 logger.warning("👂❓ Final transcription received None or empty string.")
                 return
+
+            # Periodically check _is_aborted within the loop if it's long-running.
+            # RealtimeSTT's recorder.text() is blocking, so direct check inside its internal loop isn't possible here.
+            # The check at the beginning and cancellation of the future are the main controls.
 
             self.final_transcription = text
             logger.info(f"👂✅ {Colors.apply('Final user text: ').green} {Colors.apply(text).yellow}")
@@ -393,8 +405,29 @@ class TranscriptionProcessor:
         on previously detected potential sentence ends, useful if processing needs
         to be reset or interrupted externally.
         """
-        self.potential_sentences_yielded.clear()
-        logger.info("👂⏹️ Potential sentence yield cache cleared (generation aborted).")
+        logger.info("🎙️ STT abort_generation called.")
+        self._is_aborted = True # Set flag to signal loops/feed_audio
+
+        if self.recorder:
+            logger.debug("🎙️ Calling self.recorder.abort_generation() for underlying STT engine.")
+            self.recorder.abort_generation()
+            # We are not setting self.recorder = None here.
+            # It will be None only after shutdown() or if _create_recorder fails.
+            # Or, if we want a full reset: self.recorder.shutdown(); self.recorder = None;
+
+        if self.transcription_future and not self.transcription_future.done():
+            logger.debug("🎙️ Cancelling transcription_future in abort_generation.")
+            self.transcription_future.cancel()
+        # Do NOT call _create_recorder() here. It will be called by feed_audio if needed.
+        logger.info("🎙️ STT generation aborted. Recorder will be re-created on next feed_audio if needed.")
+
+    def ensure_recorder_ready(self):
+        logger.debug("🎙️ Attempting to ensure recorder is ready for new session...")
+        if self.recorder is None or self._is_aborted:
+            logger.info("🎙️ Recorder is None or was aborted. Calling _create_recorder() to prepare for new session.")
+            self._create_recorder()
+        else:
+            logger.debug("🎙️ Recorder already initialized and not aborted.")
 
     def perform_final(self, audio_bytes: Optional[bytes] = None) -> None:
         """
@@ -756,36 +789,55 @@ class TranscriptionProcessor:
             return v
 
         pretty_cfg = {k: _pretty(v) for k, v in active_config.items()}
-        # Ensure sensitive or overly long items are handled if necessary
-        # Example: if 'api_key' in pretty_cfg: pretty_cfg['api_key'] = '********'
         padded_cfg = textwrap.indent(json.dumps(pretty_cfg, indent=2), "    ")
-
         recorder_type = "AudioToTextRecorderClient" if START_STT_SERVER else "AudioToTextRecorder"
-        logger.info(f"👂⚙️ Creating {recorder_type} with params:\n{padded_cfg}") # Changed print to logger.info
+        logger.info(f"👂⚙️ Config for {recorder_type}:\n{padded_cfg}") # Slightly modified log
 
+        # Shutdown existing recorder if it exists
+        if self.recorder is not None:
+            logger.info("🎙️ Shutting down existing STT recorder instance before creating a new one.")
+            self.recorder.shutdown()
+            self.recorder = None
 
         # --- Instantiate Recorder ---
         try:
             if START_STT_SERVER:
-                # Note: The client might use different callback names, adjust if needed
-                # For now, assume it might accept the same or handle internally
                 self.recorder = AudioToTextRecorderClient(**active_config)
-                # Ensure wake words are disabled if needed (can also be done via config dict)
                 self._set_recorder_param("use_wake_words", False)
             else:
-                # Instantiate the LOCAL recorder with the corrected active_config
                 self.recorder = AudioToTextRecorder(**active_config)
-                # Ensure wake words are disabled if needed (double check via param setting)
-                self._set_recorder_param("use_wake_words", False) # Uses the helper method
-
-            logger.info(f"👂✅ {recorder_type} instance created successfully.")
+                self._set_recorder_param("use_wake_words", False)
+            logger.info(f"👂✅ {recorder_type} instance (re)created successfully.")
 
         except Exception as e:
-            # Log the exception with traceback for detailed debugging
             logger.exception(f"👂🔥 Failed to create recorder: {e}")
-            self.recorder = None # Ensure recorder is None if creation failed
+            self.recorder = None
+            self._is_aborted = True # Ensure we stay aborted if creation fails
+            return # Do not proceed if recorder creation fails
+
+        # Manage transcription_future
+        if self.transcription_future and not self.transcription_future.done():
+            logger.debug("🎙️ Cancelling previous transcription_future before creating new one.")
+            self.transcription_future.cancel()
+
+        try:
+            loop = asyncio.get_event_loop()
+            self.transcription_future = loop.run_in_executor(None, self.transcribe_loop)
+            self._is_aborted = False # Recorder and loop are ready
+            logger.info("🎙️ STT Recorder (re)created and transcription_future (re)started.")
+        except Exception as e:
+            logger.exception("🎙️🔥 Failed to (re)start transcription_future in executor.")
+            self.transcription_future = None
+            self._is_aborted = True # Ensure we stay aborted
+
 
     def feed_audio(self, chunk: bytes, audio_meta_data: Optional[Dict[str, Any]] = None) -> None:
+        if self.recorder is None or self._is_aborted:
+            logger.info("🎙️ Recorder is None or was aborted. Creating new recorder before feeding audio.")
+            self._create_recorder() # This will set self._is_aborted = False if successful
+            if self.recorder is None or self._is_aborted: # Check again if _create_recorder failed
+                logger.error("👂💥 feed_audio: Recorder creation failed or still aborted. Cannot feed audio.")
+                return
         """
         Feeds an audio chunk to the underlying recorder instance for processing.
 
@@ -838,29 +890,36 @@ class TranscriptionProcessor:
         further processing. Sets the `shutdown_performed` flag.
         """
         if not self.shutdown_performed:
-            logger.info("👂🔌 Shutting down TranscriptionProcessor...")
-            self.shutdown_performed = True # Set flag early to stop loops/threads
+            logger.info("🎙️ TranscriptionProcessor shutting down...")
+            self._is_aborted = True # Signal loops to stop
+            self.shutdown_performed = True
+
+            if self.transcription_future and not self.transcription_future.done():
+                logger.info("🎙️ Cancelling transcription_future during shutdown.")
+                self.transcription_future.cancel()
+                # Potentially await here with timeout if needed for graceful thread exit
+            self.transcription_future = None
 
             if self.recorder:
-                logger.info("👂🔌 Calling recorder shutdown()...")
+                logger.info("👂🔌 Calling underlying recorder.shutdown()...")
                 try:
                     self.recorder.shutdown()
-                    logger.info("👂🔌 Recorder shutdown() method completed.")
+                    logger.info("👂🔌 Underlying recorder.shutdown() method completed.")
                 except Exception as e:
-                    logger.error(f"👂💥 Error during recorder shutdown: {e}", exc_info=True)
+                    logger.error(f"👂💥 Error during underlying recorder shutdown: {e}", exc_info=True)
                 finally:
-                    self.recorder = None
+                    self.recorder = None # Ensure recorder is None after shutdown
             else:
-                logger.info("👂🔌 No active recorder instance to shut down.")
+                logger.info("👂🔌 No active recorder instance to shut down during TranscriptionProcessor.shutdown().")
 
-            # Clean up other resources if necessary (e.g., turn detection?)
+            # Clean up other resources if necessary
             if USE_TURN_DETECTION and hasattr(self, 'turn_detection') and hasattr(self.turn_detection, 'shutdown'):
                 logger.info("👂🔌 Shutting down TurnDetection...")
                 try:
-                    self.turn_detection.shutdown() # Example: Assuming TurnDetection has a shutdown method
+                    self.turn_detection.shutdown()
                 except Exception as e:
                      logger.error(f"👂💥 Error during TurnDetection shutdown: {e}", exc_info=True)
 
-            logger.info("👂🔌 TranscriptionProcessor shutdown process finished.")
+            logger.info("🎙️ TranscriptionProcessor shutdown process finished.")
         else:
             logger.info("👂ℹ️ Shutdown already performed.")

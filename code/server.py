@@ -978,6 +978,9 @@ async def websocket_endpoint(ws: WebSocket):
             recording_start_callback=callbacks.on_recording_start,
             silence_active_callback=callbacks.on_silence_active
         )
+        # Proactively prepare the transcriber for the new session to avoid deadlock
+        logger.info("🚀 Proactively ensuring transcriber is ready for new session...")
+        app.state.AudioInputProcessor.transcriber.ensure_recorder_ready()
     else:
         logger.error("AudioInputProcessor not found in app.state, cannot set active listeners.")
 

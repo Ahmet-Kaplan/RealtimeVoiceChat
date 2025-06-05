@@ -73,7 +73,7 @@ class AudioInputProcessor:
         )
         # Flag to indicate if the transcription loop has failed fatally
         self._transcription_failed = False
-        self.transcription_task = asyncio.create_task(self._run_transcription_loop())
+        # self.transcription_task = asyncio.create_task(self._run_transcription_loop()) # Removed
 
         self.interrupted = False
         logger.info("👂🚀 AudioInputProcessor initialized.")
@@ -160,40 +160,9 @@ class AudioInputProcessor:
     def abort_generation(self) -> None:
         """Signals the underlying transcriber to abort any ongoing generation process."""
         logger.info("👂🛑 Aborting generation requested.")
-        self.transcriber.abort_generation()
+        self.transcriber.abort_generation() # This now also re-creates the recorder and its loop
 
-    async def _run_transcription_loop(self) -> None:
-        """
-        Continuously runs the transcription loop in a background asyncio task.
-
-        It repeatedly calls the underlying `transcribe_loop`. If `transcribe_loop`
-        finishes normally (completes one cycle), this loop calls it again.
-        If `transcribe_loop` raises an Exception, it's treated as a fatal error,
-        a flag is set, and this loop terminates. Handles CancelledError separately.
-        """
-        task_name = self.transcription_task.get_name() if hasattr(self.transcription_task, 'get_name') else 'TranscriptionTask'
-        logger.info(f"👂▶️ Starting background transcription task ({task_name}).")
-        while True: # Loop restored to continuously call transcribe_loop
-            try:
-                # Run one cycle of the underlying blocking loop
-                await asyncio.to_thread(self.transcriber.transcribe_loop)
-                # If transcribe_loop returns without error, it means one cycle is complete.
-                # The `while True` ensures it will be called again.
-                logger.debug("👂✅ TranscriptionProcessor.transcribe_loop completed one cycle.")
-                # Add a small sleep to prevent potential tight loop if transcribe_loop returns instantly
-                await asyncio.sleep(0.01)
-            except asyncio.CancelledError:
-                logger.info(f"👂🚫 Transcription loop ({task_name}) cancelled.")
-                # Do not set failure flag on cancellation
-                break # Exit the while loop
-            except Exception as e:
-                # An actual error occurred within transcribe_loop
-                logger.error(f"👂💥 Transcription loop ({task_name}) encountered a fatal error: {e}. Loop terminated.", exc_info=True)
-                self._transcription_failed = True # Set failure flag
-                break # Exit the while loop, stopping retries
-
-        logger.info(f"👂⏹️ Background transcription task ({task_name}) finished.")
-
+    # _run_transcription_loop method removed
 
     def process_audio_chunk(self, raw_bytes: bytes) -> np.ndarray:
         """
@@ -255,25 +224,18 @@ class AudioInputProcessor:
                     logger.info(f"👂🔄 音频处理循环仍在运行，已处理 {chunk_counter} 个音频块")
                     last_log_time = current_time
                 
-                # Check if the transcription task has permanently failed *before* getting item
-                if self._transcription_failed:
-                    logger.error("👂🛑 Transcription task failed previously. Stopping audio processing.")
-                    break # Stop processing if transcription backend is down
+                # Check if the transcription task (now managed by TranscriptionProcessor) has permanently failed.
+                # This check might need adjustment as _transcription_failed is local to AudioInputProcessor
+                # and not directly aware of the state of TranscriptionProcessor's new transcription_future.
+                # For now, we rely on feed_audio being robust if the recorder inside transcriber is None temporarily.
+                # A more robust solution might involve the transcriber exposing a health status.
+                if not self.transcriber or self.transcriber.shutdown_performed: # Check if transcriber itself is shut down
+                    logger.warning("👂⏹️ Transcriber is shut down. Stopping audio processing.")
+                    break
+                if self._transcription_failed: # This flag is still relevant if _run_transcription_loop (now removed) failed
+                    logger.error("👂🛑 AudioInputProcessor's transcription management indicated a past failure. Stopping audio processing.")
+                    break
 
-                # Check if the task finished unexpectedly (e.g., cancelled but not failed)
-                # Needs to check self.transcription_task existence as it might be None during shutdown
-                if self.transcription_task and self.transcription_task.done() and not self._transcription_failed:
-                     # Attempt to check exception status if task is done
-                    task_exception = self.transcription_task.exception()
-                    if task_exception and not isinstance(task_exception, asyncio.CancelledError):
-                        # If there was an exception other than CancelledError, treat it as failed.
-                        logger.error(f"👂🛑 Transcription task finished with unexpected error: {task_exception}. Stopping audio processing.", exc_info=task_exception)
-                        self._transcription_failed = True # Mark as failed
-                        break
-                    else:
-                         # Finished cleanly or was cancelled
-                        logger.warning("👂⏹️ Transcription task is no longer running (completed or cancelled). Stopping audio processing.")
-                        break # Stop processing
 
                 logger.debug("👂⏳ 等待音频队列中的数据...")
                 audio_data = await audio_queue.get()
@@ -328,20 +290,9 @@ class AudioInputProcessor:
         # Ensure transcriber shutdown is called first to signal the loop
         if hasattr(self.transcriber, 'shutdown'):
              logger.info("👂🛑 Signaling TranscriptionProcessor to shut down.")
-             self.transcriber.shutdown()
+             self.transcriber.shutdown() # TranscriptionProcessor's shutdown now handles its future
         else:
              logger.warning("👂⚠️ TranscriptionProcessor does not have a shutdown method.")
 
-        if self.transcription_task and not self.transcription_task.done():
-            task_name = self.transcription_task.get_name() if hasattr(self.transcription_task, 'get_name') else 'TranscriptionTask'
-            logger.info(f"👂🚫 Cancelling background transcription task ({task_name})...")
-            self.transcription_task.cancel()
-            # Optional: Add await with timeout here in an async shutdown context
-            # try:
-            #     await asyncio.wait_for(self.transcription_task, timeout=5.0)
-            # except (asyncio.TimeoutError, asyncio.CancelledError, Exception) as e:
-            #     logger.warning(f"👂⚠️ Error/Timeout waiting for transcription task {task_name} cancellation: {e}")
-        else:
-            logger.info("👂✅ Transcription task already done or not running during shutdown.")
-
+        # self.transcription_task is removed, its cancellation is now handled by self.transcriber.shutdown()
         logger.info("👂👋 AudioInputProcessor shutdown sequence initiated.")
