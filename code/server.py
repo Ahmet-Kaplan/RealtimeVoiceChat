@@ -121,8 +121,7 @@ async def lifespan(app: FastAPI):
         llm_provider=LLM_START_PROVIDER,
         llm_model=LLM_START_MODEL,
         no_think=NO_THINK,
-        orpheus_model=TTS_ORPHEUS_MODEL,
-        base_url=BASE_URL
+        orpheus_model=TTS_ORPHEUS_MODEL
     )
 
     app.state.Upsampler = UpsampleOverlap()
