@@ -18,6 +18,7 @@ import time
 import threading # Keep threading for SpeechPipelineManager internals and AbortWorker
 import sys
 import os # Added for environment variable access
+import argparse
 
 from typing import Any, Dict, Optional, Callable # Added for type hints in docstrings
 from contextlib import asynccontextmanager
@@ -27,27 +28,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import HTMLResponse, Response, FileResponse
 
+# Configuration variables - will be set from console arguments
 USE_SSL = False
-#TTS_START_ENGINE = "orpheus"
-#TTS_START_ENGINE = "kokoro"
-TTS_START_ENGINE = "coqui"
-TTS_ORPHEUS_MODEL = "Orpheus_3B-1BaseGGUF/mOrpheus_3B-1Base_Q4_K_M.gguf"
+TTS_START_ENGINE = "coqui"  # Default value
 TTS_ORPHEUS_MODEL = "orpheus-3b-0.1-ft-Q8_0-GGUF/orpheus-3b-0.1-ft-q8_0.gguf"
-
-LLM_START_PROVIDER = "ollama"
-LLM_BASE_URL = "http://192.168.64.164:8080"
-LLM_START_MODEL = "gemma-3n-E4B-it-UD-Q4_K_XL.gguf"
-#LLM_START_MODEL = "Mistral-Small-3.2-24B-Instruct-2506-Q4_K_M.gguf"
-#LLM_START_MODEL = "qwen3:30b-a3b"
-#LLM_START_MODEL = "hf.co/bartowski/huihui-ai_Mistral-Small-24B-Instruct-2501-abliterated-GGUF:Q4_K_M"
-# LLM_START_PROVIDER = "lmstudio"
-# LLM_START_MODEL = "Qwen3-30B-A3B-GGUF/Qwen3-30B-A3B-Q3_K_L.gguf"
+LLM_START_PROVIDER = "ollama"  # Default value
+LLM_BASE_URL = "http://192.168.64.164:8080"  # Default value
+LLM_START_MODEL = "gemma-3n-E4B-it-UD-Q4_K_XL.gguf"  # Default value
 NO_THINK = False
-DIRECT_STREAM = TTS_START_ENGINE=="orpheus"
-
-if __name__ == "__main__":
-    logger.info(f"🖥️⚙️ {Colors.apply('[PARAM]').blue} Starting engine: {Colors.apply(TTS_START_ENGINE).blue}")
-    logger.info(f"🖥️⚙️ {Colors.apply('[PARAM]').blue} Direct streaming: {Colors.apply('ON' if DIRECT_STREAM else 'OFF').blue}")
+DIRECT_STREAM = False
 
 # Define the maximum allowed size for the incoming audio queue
 try:
@@ -58,7 +47,6 @@ except ValueError:
     if __name__ == "__main__":
         logger.warning("🖥️⚠️ Invalid MAX_AUDIO_QUEUE_SIZE env var. Using default: 50")
     MAX_AUDIO_QUEUE_SIZE = 50
-
 
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -406,7 +394,13 @@ async def send_tts_chunks(app: FastAPI, message_queue: asyncio.Queue, callbacks:
                 callbacks.interruption_time = 0 # Reset via callbacks
                 logger.info(Colors.apply("🖥️🎙️ interruption flag reset after 2 seconds").cyan)
 
-            is_tts_finished = app.state.SpeechPipelineManager.is_valid_gen() and app.state.SpeechPipelineManager.running_generation.audio_quick_finished
+            # Safely check if running generation exists and has audio_quick_finished
+            running_generation = app.state.SpeechPipelineManager.running_generation
+            is_tts_finished = (
+                app.state.SpeechPipelineManager.is_valid_gen()
+                and running_generation is not None
+                and getattr(running_generation, 'audio_quick_finished', False)
+            )
 
             def log_status():
                 nonlocal prev_status
@@ -677,153 +671,85 @@ class TranscriptionCallbacks:
             audio: The raw audio bytes corresponding to the final transcription. (Currently unused)
             txt: The transcription text (might be slightly refined in on_final).
         """
-        logger.info(Colors.apply('🖥️🏁 =================== USER TURN END ===================').light_gray)
-        self.user_finished_turn = True
-        self.user_interrupted = False # Reset connection-specific flag (user finished, not interrupted)
-        # Access global manager state
-        if self.app.state.SpeechPipelineManager.is_valid_gen():
-            logger.info(f"{Colors.apply('🖥️🔊 TTS ALLOWED (before final)').blue}")
-            self.app.state.SpeechPipelineManager.running_generation.tts_quick_allowed_event.set()
+        logger.info(f"{Colors.apply('🖥️✅ FINAL USER REQUEST: ').green}{txt}")
+        # Use connection-specific state via callbacks
+        self.user_finished_turn = True # Update via callbacks
+        self.is_hot = False # Reset via callbacks
+        self.synthesis_started = False # Reset via callbacks
 
-        # first block further incoming audio (Audio processor's state)
-        if not self.app.state.AudioInputProcessor.interrupted:
-            logger.info(f"{Colors.apply('🖥️🎙️ ⏸️ Microphone interrupted (end of turn)').cyan}")
-            self.app.state.AudioInputProcessor.interrupted = True
-            self.interruption_time = time.time() # Set connection-specific flag
+        # Update global AudioInputProcessor state
+        self.app.state.AudioInputProcessor.interrupted = False
+        # Reset connection-specific interruption time via callbacks
+        callbacks.interruption_time = 0
 
-        logger.info(f"{Colors.apply('🖥️🔊 TTS STREAM RELEASED').blue}")
-        self.tts_to_client = True # Set connection-specific flag
+        # Release TTS stream to client via callbacks
+        callbacks.tts_to_client = True
 
-        # Send final user request (using the reliable final_transcription OR current partial if final isn't set yet)
-        user_request_content = self.final_transcription if self.final_transcription else self.partial_transcription
-        self.message_queue.put_nowait({
-            "type": "final_user_request",
-            "content": user_request_content
-        })
+        # Send final user request to client
+        self.message_queue.put_nowait({"type": "final_user_request", "content": txt})
 
-        # Access global manager state
-        if self.app.state.SpeechPipelineManager.is_valid_gen():
-            # Send partial assistant answer (if available) to the client
-            # Use connection-specific user_interrupted flag
-            if self.app.state.SpeechPipelineManager.running_generation.quick_answer and not self.user_interrupted:
-                self.assistant_answer = self.app.state.SpeechPipelineManager.running_generation.quick_answer
-                self.message_queue.put_nowait({
-                    "type": "partial_assistant_answer",
-                    "content": self.assistant_answer
-                })
+        # Send any pending partial assistant answer immediately
+        if self.assistant_answer:
+            self.message_queue.put_nowait({"type": "partial_assistant_answer", "content": self.assistant_answer})
 
-        logger.info(f"🖥️🧠 Adding user request to history: '{user_request_content}'")
-        # Access global manager state
-        self.app.state.SpeechPipelineManager.history.append({"role": "user", "content": user_request_content})
+        # Add user request to history
+        self.app.state.SpeechPipelineManager.history.append({"role": "user", "content": txt})
 
     def on_final(self, txt: str):
         """
-        Callback invoked when the final transcription result for a user turn is available.
+        Callback invoked when the final STT result for a user turn is confirmed.
 
-        Logs the final transcription and stores it.
+        Logs the final transcription and resets the final transcription variable.
 
         Args:
-            txt: The final transcription text.
+            txt: The final confirmed transcription text.
         """
-        logger.info(f"\n{Colors.apply('🖥️✅ FINAL USER REQUEST (STT Callback): ').green}{txt}")
-        if not self.final_transcription: # Store it if not already set by on_before_final logic
-             self.final_transcription = txt
+        logger.info(f"{Colors.apply('🖥️✅ FINAL TRANSCRIPTION: ').green}{txt}")
+        self.final_transcription = txt
+        # self.reset_state() is now called in send_tts_chunks after final answer is sent
 
     def abort_generations(self, reason: str):
-        """
-        Triggers the abortion of any ongoing speech generation process.
-
-        Logs the reason and calls the SpeechPipelineManager's abort method.
-
-        Args:
-            reason: A string describing why the abortion is triggered.
-        """
-        logger.info(f"{Colors.apply('🖥️🛑 Aborting generation:').blue} {reason}")
-        # Access global manager state
-        self.app.state.SpeechPipelineManager.abort_generation(reason=f"server.py abort_generations: {reason}")
+        """Aborts any running speech generation and resets state."""
+        logger.info(f"🖥️🛑 Aborting generations due to: {reason}")
+        self.app.state.SpeechPipelineManager.abort()
+        self.reset_state()
 
     def on_silence_active(self, silence_active: bool):
         """
-        Callback invoked when the silence detection state changes.
+        Callback invoked when the silence state changes.
 
-        Updates the internal silence_active flag.
+        Updates the internal silence_active flag and sends a message to the client.
 
         Args:
-            silence_active: True if silence is currently detected, False otherwise.
+            silence_active: True if silence is detected, False otherwise.
         """
-        # logger.debug(f"🖥️🎙️ Silence active: {silence_active}") # Optional: Can be noisy
         self.silence_active = silence_active
+        self.message_queue.put_nowait({"type": "silence_active", "content": silence_active})
 
     def on_partial_assistant_text(self, txt: str):
         """
-        Callback invoked when a partial text result from the assistant (LLM) is available.
+        Callback invoked when a partial assistant response text is generated by the LLM.
 
-        Updates the internal assistant answer state and sends the partial answer to the client,
-        unless the user has interrupted.
+        Appends the text to the connection-specific assistant_answer and sends it
+        to the client as a partial assistant answer.
 
         Args:
-            txt: The partial assistant text.
+            txt: The partial assistant response text.
         """
-        logger.info(f"{Colors.apply('🖥️💬 PARTIAL ASSISTANT ANSWER: ').green}{txt}")
-        # Use connection-specific user_interrupted flag
-        if not self.user_interrupted:
-            self.assistant_answer = txt
-            # Use connection-specific tts_to_client flag
-            if self.tts_to_client:
-                self.message_queue.put_nowait({
-                    "type": "partial_assistant_answer",
-                    "content": txt
-                })
+        self.assistant_answer += txt
+        self.message_queue.put_nowait({"type": "partial_assistant_answer", "content": txt})
 
     def on_recording_start(self):
-        """
-        Callback invoked when the audio input processor starts recording user speech.
-
-        If client-side TTS is playing, it triggers an interruption: stops server-side
-        TTS streaming, sends stop/interruption messages to the client, aborts ongoing
-        generation, sends any final assistant answer generated so far, and resets relevant state.
-        """
-        logger.info(f"{Colors.ORANGE}🖥️🎙️ Recording started.{Colors.RESET} TTS Client Playing: {self.tts_client_playing}")
-        # Use connection-specific tts_client_playing flag
-        if self.tts_client_playing:
-            self.tts_to_client = False # Stop server sending TTS
-            self.user_interrupted = True # Mark connection as user interrupted
-            logger.info(f"{Colors.apply('🖥️❗ INTERRUPTING TTS due to recording start').blue}")
-
-            # Send final assistant answer *if* one was generated and not sent
-            logger.info(Colors.apply("🖥️✅ Sending final assistant answer (forced on interruption)").pink)
-            self.send_final_assistant_answer(forced=True)
-
-            # Minimal reset for interruption:
-            self.tts_chunk_sent = False # Reset chunk sending flag
-            # self.assistant_answer = "" # Optional: Clear partial answer if needed
-
-            logger.info("🖥️🛑 Sending stop_tts to client.")
-            self.message_queue.put_nowait({
-                "type": "stop_tts", # Client handles this to mute/ignore
-                "content": ""
-            })
-
-            logger.info(f"{Colors.apply('🖥️🛑 RECORDING START ABORTING GENERATION').red}")
-            self.abort_generations("on_recording_start, user interrupts, TTS Playing")
-
-            logger.info("🖥️❗ Sending tts_interruption to client.")
-            self.message_queue.put_nowait({ # Tell client to stop playback and clear buffer
-                "type": "tts_interruption",
-                "content": ""
-            })
-
-            # Reset state *after* performing actions based on the old state
-            # Be careful what exactly needs reset vs persists (like tts_client_playing)
-            # self.reset_state() # Might clear too much, like user_interrupted prematurely
+        """Callback invoked when recording starts."""
+        logger.info("🖥️🎙️ Recording started")
+        self.message_queue.put_nowait({"type": "recording_started"})
 
     def send_final_assistant_answer(self, forced=False):
         """
-        Sends the final (or best available) assistant answer to the client.
+        Sends the final assistant answer to the client.
 
-        Constructs the full answer from quick and final parts if available.
-        If `forced` and no full answer exists, uses the last partial answer.
-        Cleans the text and sends it as 'final_assistant_answer' if not already sent.
+        Constructs the final answer from quick and final generation parts,
+        formats it, and sends it as 'final_assistant_answer' if not already sent.
 
         Args:
             forced: If True, attempts to send the last partial answer if no complete
@@ -944,6 +870,57 @@ async def websocket_endpoint(ws: WebSocket):
 # Entry point
 # --------------------------------------------------------------------
 if __name__ == "__main__":
+
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(
+        description="Real-time voice chat server with configurable TTS and LLM settings",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python server.py --help
+  python server.py --tts-engine coqui --llm-provider ollama --llm-base-url http://localhost:8080 --llm-model gemma-3n-E4B-it-UD-Q4_K_XL.gguf
+  python server.py --tts-engine orpheus --llm-provider lmstudio --llm-base-url http://localhost:1234 --llm-model Qwen3-30B-A3B-GGUF/Qwen3-30B-A3B-Q3_K_L.gguf
+  python server.py --tts-engine kokoro --llm-provider openai --llm-base-url https://api.openai.com/v1 --llm-model gpt-4o-mini
+
+Available TTS Engines:
+  coqui    - Coqui TTS engine (default)
+  orpheus  - Orpheus TTS engine with direct streaming
+  kokoro   - Kokoro TTS engine
+
+Available LLM Providers:
+  ollama   - Local Ollama instance
+  lmstudio - Local LM Studio instance
+  openai   - OpenAI API
+  anthropic- Anthropic Claude API
+        """
+    )
+    
+    parser.add_argument("--tts-engine", type=str, default="coqui", 
+                        choices=["coqui", "orpheus", "kokoro"],
+                        help="TTS engine to use (default: coqui)")
+    parser.add_argument("--llm-provider", type=str, default="ollama",
+                        choices=["ollama", "lmstudio", "openai", "anthropic"],
+                        help="LLM provider to use (default: ollama)")
+    parser.add_argument("--llm-base-url", type=str, default="http://192.168.64.164:8080",
+                        help="Base URL for LLM API (default: http://192.168.64.164:8080)")
+    parser.add_argument("--llm-model", type=str, default="gemma-3n-E4B-it-UD-Q4_K_XL.gguf",
+                        help="LLM model to use (default: gemma-3n-E4B-it-UD-Q4_K_XL.gguf)")
+    
+    args = parser.parse_args()
+    
+    # Update configuration variables from parsed arguments
+    TTS_START_ENGINE = args.tts_engine
+    LLM_START_PROVIDER = args.llm_provider
+    LLM_BASE_URL = args.llm_base_url
+    LLM_START_MODEL = args.llm_model
+    DIRECT_STREAM = TTS_START_ENGINE == "orpheus"
+    
+    # Log configuration
+    logger.info(f"🖥️⚙️ {Colors.apply('[CONFIG]').blue} TTS Engine: {Colors.apply(TTS_START_ENGINE).blue}")
+    logger.info(f"🖥️⚙️ {Colors.apply('[CONFIG]').blue} LLM Provider: {Colors.apply(LLM_START_PROVIDER).blue}")
+    logger.info(f"🖥️⚙️ {Colors.apply('[CONFIG]').blue} LLM Base URL: {Colors.apply(LLM_BASE_URL).blue}")
+    logger.info(f"🖥️⚙️ {Colors.apply('[CONFIG]').blue} LLM Model: {Colors.apply(LLM_START_MODEL).blue}")
+    logger.info(f"🖥️⚙️ {Colors.apply('[CONFIG]').blue} Direct streaming: {Colors.apply('ON' if DIRECT_STREAM else 'OFF').blue}")
 
     # Run the server without SSL
     if not USE_SSL:
