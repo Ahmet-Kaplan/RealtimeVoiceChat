@@ -1,6 +1,7 @@
 # speech to text and text to speech
 realtimestt==0.3.104
-realtimetts[all]
+coqui-tts[all]==0.27.0  # upgraded to fix XTTS `_validate_model_class` error
+transformers>=4.41.0
 
 # webserver dependencies
 fastapi
