@@ -822,6 +822,7 @@ class LLM:
         Handles reading bytes, decoding UTF-8, parsing JSON chunks, extracting message content,
         and checking for the 'done' signal. Checks for cancellation before processing each chunk.
         Ensures the response is closed upon completion, error, or cancellation.
+        This version is updated to handle both native Ollama and OpenAI-compatible SSE formats.
 
         Args:
             response: The streaming requests.Response object from the Ollama API call.
@@ -840,80 +841,82 @@ class LLM:
         buffer = ""
         processed_done = False # Flag to track if 'done' message was processed
         try:
-            # --- Start Change ---
-            # Wrap the iteration in a try block to catch the specific AttributeError
             try:
-                for chunk_bytes in response.iter_content(chunk_size=None): # None = read whatever is available
-                    # Check for cancellation *before* processing chunk
+                for chunk_bytes in response.iter_content(chunk_size=None):
                     with self._requests_lock:
                         if request_id not in self._active_requests:
                             logger.info(f"🤖🗑️ Ollama stream {request_id} cancelled or finished externally during iteration (pre-chunk check).")
-                            break # Exit the loop cleanly
+                            break
 
                     if not chunk_bytes:
-                        continue # Skip empty chunks
+                        continue
 
                     buffer += chunk_bytes.decode('utf-8')
 
-                    # Process complete JSON objects separated by newlines in the buffer
                     while '\n' in buffer:
                         line, buffer = buffer.split('\n', 1)
-                        if not line.strip():
-                            continue # Skip empty lines
+                        line = line.strip()
+                        if not line:
+                            continue
+
+                        json_str = line
+                        if json_str.startswith('data: '):
+                            json_str = json_str[len('data: '):].strip()
+
+                        if json_str == '[DONE]':
+                            logger.debug(f"🤖✅ [{request_id}] Ollama stream finished with [DONE] message.")
+                            processed_done = True
+                            break
+                        
+                        if not json_str:
+                            continue
 
                         try:
-                            chunk = json.loads(line)
+                            chunk = json.loads(json_str)
+                            
                             if chunk.get('error'):
                                 logger.error(f"🤖💥 Ollama stream returned error for {request_id}: {chunk['error']}")
                                 raise RuntimeError(f"Ollama stream error: {chunk['error']}")
-                            content = chunk.get('message', {}).get('content')
+
+                            content = None
+                            # Handle OpenAI-compatible format
+                            if 'choices' in chunk and chunk.get('choices') and isinstance(chunk['choices'], list) and len(chunk['choices']) > 0:
+                                if 'delta' in chunk['choices'][0] and isinstance(chunk['choices'][0]['delta'], dict):
+                                    content = chunk['choices'][0]['delta'].get('content')
+                            # Handle native Ollama format
+                            elif 'message' in chunk and isinstance(chunk.get('message'), dict):
+                                content = chunk.get('message', {}).get('content')
+
                             if content:
                                 token_count += 1
                                 yield content
-                            if chunk.get('done'):
-                                logger.debug(f"🤖✅ [{request_id}] Ollama signalled 'done'.")
-                                # Ensure any remaining buffer is cleared (should be unlikely if 'done' is last)
-                                buffer = ""
-                                processed_done = True # Mark done as processed
-                                break # Exit inner while loop on 'done'
-                        except json.JSONDecodeError:
-                            logger.warning(f"🤖⚠️ [{request_id}] Failed to decode JSON line: '{line[:100]}...'")
-                            # Continue trying to process buffer
-                        except Exception as e:
-                            # Reraise other exceptions during JSON processing
-                            logger.error(f"🤖💥 [{request_id}] Error processing Ollama stream chunk: {e}", exc_info=True)
-                            raise # Reraise for outer try/except
 
-                    # If 'done' was received and processed, break outer loop too
+                            if chunk.get('done'):
+                                logger.debug(f"🤖✅ [{request_id}] Ollama signalled 'done' in JSON.")
+                                processed_done = True
+                                break
+                        except json.JSONDecodeError:
+                            logger.warning(f"🤖⚠️ [{request_id}] Failed to decode JSON line. Raw line: '{line}'")
+                        except Exception as e:
+                            logger.error(f"🤖💥 [{request_id}] Error processing Ollama stream chunk: {e}", exc_info=True)
+                            raise
+
                     if processed_done:
                         break
-            # Catch the specific error from the race condition
             except AttributeError as e:
-                # Check if the error message is exactly what we expect and if cancellation happened
                 is_cancelled = False
                 with self._requests_lock:
                     is_cancelled = request_id not in self._active_requests
-
-                # More robust check: verify it's the expected NoneType error on read
-                # and ideally confirm cancellation happened concurrently.
                 if "'NoneType' object has no attribute 'read'" in str(e):
-                    # This is the specific error we expect from response.close() being called concurrently.
                     if is_cancelled:
                         logger.warning(f"🤖⚠️ [{request_id}] Caught AttributeError ('NoneType' has no attribute 'read') during Ollama stream iteration, likely due to concurrent cancellation. Stopping iteration.")
                     else:
-                        # This case is less likely but possible if the error source is different,
-                        # or cancellation happened *just* after the check but before the exception.
                         logger.warning(f"🤖⚠️ [{request_id}] Caught AttributeError ('NoneType' has no attribute 'read') during Ollama stream iteration. Request *might* not be marked cancelled yet, but stopping iteration as stream is likely closed.")
-                    # Break the (now non-existent) outer loop implicitly by exiting the 'try' block.
                 else:
-                    # If it's a different AttributeError, re-raise it.
                     logger.error(f"🤖💥 [{request_id}] Caught unexpected AttributeError during Ollama stream iteration: {e}", exc_info=True)
                     raise e
-            # --- End Change ---
 
-
-            # Check if loop exited due to cancellation flag (if AttributeError wasn't caught)
-            if not processed_done: # Only log this if we didn't finish normally
+            if not processed_done:
                 with self._requests_lock:
                     if request_id not in self._active_requests:
                         logger.info(f"🤖🗑️ Ollama stream {request_id} processing stopped due to cancellation flag after loop.")
@@ -921,38 +924,28 @@ class LLM:
             logger.debug(f"🤖✅ [{request_id}] Finished yielding {token_count} Ollama tokens (processed_done={processed_done}).")
 
         except requests.exceptions.ChunkedEncodingError as e:
-             # This can happen if the connection is closed prematurely (e.g., by cancellation)
              is_cancelled = False
              with self._requests_lock:
                  is_cancelled = request_id not in self._active_requests
              if is_cancelled:
                  logger.warning(f"🤖⚠️ Ollama chunked encoding error likely due to cancellation for {request_id}: {e}")
-                 # Don't raise an error if cancelled
              else:
                  logger.error(f"🤖💥 Ollama chunked encoding error during streaming ({request_id}): {e}")
-                 # Reraise as ConnectionError for generate() to handle
                  raise ConnectionError(f"Ollama communication error during streaming: {e}") from e
         except requests.exceptions.RequestException as e:
-            # Catch other request errors during streaming
             is_cancelled = False
             with self._requests_lock:
                 is_cancelled = request_id not in self._active_requests
             if is_cancelled:
                  logger.warning(f"🤖⚠️ Ollama requests error likely due to cancellation for {request_id}: {e}")
-                 # Don't raise an error if cancelled
             else:
                  logger.error(f"🤖💥 Ollama requests error during streaming ({request_id}): {e}")
-                 # Reraise as ConnectionError for generate() to handle
                  raise ConnectionError(f"Ollama communication error during streaming: {e}") from e
         except Exception as e:
-            # Catch the RuntimeError from 'error' field or other unexpected errors
-            # Do not catch the AttributeError here if it was re-raised above
             if not isinstance(e, AttributeError):
                  logger.error(f"🤖💥 Unexpected error during Ollama streaming ({request_id}): {e}", exc_info=True)
-            raise # Reraise for generate() to handle
+            raise
         finally:
-             # Ensure response is closed if iter_content finishes or breaks
-             # The cancellation logic also tries to close, but this catches normal completion
              if response:
                  try:
                      logger.debug(f"🤖🗑️ [{request_id}] Closing Ollama response in _yield_ollama_chunks finally.")
