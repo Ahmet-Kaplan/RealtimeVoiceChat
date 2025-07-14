@@ -13,3 +13,7 @@ python-dotenv
 # llm providers
 ollama
 openai
+
+# macos
+py-cpuinfo
+deepspeed
