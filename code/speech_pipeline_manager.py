@@ -125,6 +125,7 @@ class SpeechPipelineManager:
             llm_provider: str = "ollama",
             llm_model: str = "hf.co/bartowski/huihui-ai_Mistral-Small-24B-Instruct-2501-abliterated-GGUF:Q4_K_M",
             llm_base_url: Optional[str] = None,
+            llm_api_key: Optional[str] = None,
             no_think: bool = False,
             orpheus_model: str = "orpheus-3b-0.1-ft-Q8_0-GGUF/orpheus-3b-0.1-ft-q8_0.gguf",
         ):
@@ -147,6 +148,7 @@ class SpeechPipelineManager:
         self.llm_provider = llm_provider
         self.llm_model = llm_model
         self.llm_base_url = llm_base_url
+        self.llm_api_key = llm_api_key
         self.no_think = no_think
         self.orpheus_model = orpheus_model
 
@@ -168,6 +170,7 @@ class SpeechPipelineManager:
             backend=self.llm_provider, # Or your backend
             model=self.llm_model,
             base_url=self.llm_base_url,
+            api_key=self.llm_api_key,
             system_prompt=self.system_prompt,
             no_think=no_think,
         )

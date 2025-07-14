@@ -28,15 +28,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import HTMLResponse, Response, FileResponse
 
-# Configuration variables - will be set from console arguments
+# Configuration variables will be loaded from environment variables within the lifespan context
 USE_SSL = False
-TTS_START_ENGINE = "coqui"  # Default value
-TTS_ORPHEUS_MODEL = "orpheus-3b-0.1-ft-Q8_0-GGUF/orpheus-3b-0.1-ft-q8_0.gguf"
-LLM_START_PROVIDER = "ollama"  # Default value
-LLM_BASE_URL = "http://192.168.64.164:8080"  # Default value
-LLM_START_MODEL = "gemma-3n-E4B-it-UD-Q4_K_XL.gguf"  # Default value
 NO_THINK = False
-DIRECT_STREAM = False
+DIRECT_STREAM = os.getenv("TTS_START_ENGINE") == "orpheus"
 
 # Define the maximum allowed size for the incoming audio queue
 try:
@@ -51,14 +46,11 @@ except ValueError:
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-#from handlerequests import LanguageProcessor
-#from audio_out import AudioOutProcessor
 from audio_in import AudioInputProcessor
 from speech_pipeline_manager import SpeechPipelineManager
 from colors import Colors
 
 LANGUAGE = "en"
-# TTS_FINAL_TIMEOUT = 0.5 # unsure if 1.0 is needed for stability
 TTS_FINAL_TIMEOUT = 1.0 # unsure if 1.0 is needed for stability
 
 # --------------------------------------------------------------------
@@ -106,23 +98,39 @@ async def lifespan(app: FastAPI):
         app: The FastAPI application instance.
     """
     logger.info("🖥️▶️ Server starting up")
+    
+    # Load configuration from environment variables inside the lifespan
+    tts_start_engine = os.getenv("TTS_START_ENGINE", "coqui")
+    tts_orpheus_model = os.getenv("TTS_ORPHEUS_MODEL", "orpheus-3b-0.1-ft-Q8_0-GGUF/orpheus-3b-0.1-ft-q8_0.gguf")
+    llm_start_provider = os.getenv("LLM_START_PROVIDER", "ollama")
+    llm_base_url = os.getenv("LLM_BASE_URL", "http://127.0.0.1:11434")
+    llm_start_model = os.getenv("LLM_START_MODEL", "gemma-3n-E4B-it-UD-Q4_K_XL.gguf")
+    llm_api_key = os.getenv("LLM_API_KEY")
+
+    logger.info(f"🖥️⚙️ {Colors.apply('[LIFESPAN CONFIG]').blue} TTS Engine: {Colors.apply(tts_start_engine).blue}")
+    logger.info(f"🖥️⚙️ {Colors.apply('[LIFESPAN CONFIG]').blue} LLM Provider: {Colors.apply(llm_start_provider).blue}")
+    logger.info(f"🖥️⚙️ {Colors.apply('[LIFESPAN CONFIG]').blue} LLM Base URL: {Colors.apply(llm_base_url).blue}")
+    logger.info(f"🖥️⚙️ {Colors.apply('[LIFESPAN CONFIG]').blue} LLM Model: {Colors.apply(llm_start_model).blue}")
+    logger.info(f"🖥️⚙️ {Colors.apply('[LIFESPAN CONFIG]').blue} LLM API Key is {'SET' if llm_api_key else 'NOT SET'}")
+
     # Initialize global components, not connection-specific state
     app.state.SpeechPipelineManager = SpeechPipelineManager(
-        tts_engine=TTS_START_ENGINE,
-        llm_provider=LLM_START_PROVIDER,
-        llm_model=LLM_START_MODEL,
-        llm_base_url=LLM_BASE_URL,
+        tts_engine=tts_start_engine,
+        llm_provider=llm_start_provider,
+        llm_model=llm_start_model,
+        llm_base_url=llm_base_url,
+        llm_api_key=llm_api_key,
         no_think=NO_THINK,
-        orpheus_model=TTS_ORPHEUS_MODEL,
+        orpheus_model=tts_orpheus_model,
     )
 
     app.state.Upsampler = UpsampleOverlap()
     app.state.AudioInputProcessor = AudioInputProcessor(
         LANGUAGE,
-        is_orpheus=TTS_START_ENGINE=="orpheus",
+        is_orpheus=tts_start_engine=="orpheus",
         pipeline_latency=app.state.SpeechPipelineManager.full_output_pipeline_latency / 1000, # seconds
     )
-    app.state.Aborting = False # Keep this? Its usage isn't clear in the provided snippet. Minimizing changes.
+    app.state.Aborting = False
 
     yield
 
@@ -680,10 +688,10 @@ class TranscriptionCallbacks:
         # Update global AudioInputProcessor state
         self.app.state.AudioInputProcessor.interrupted = False
         # Reset connection-specific interruption time via callbacks
-        callbacks.interruption_time = 0
+        self.interruption_time = 0
 
         # Release TTS stream to client via callbacks
-        callbacks.tts_to_client = True
+        self.tts_to_client = True
 
         # Send final user request to client
         self.message_queue.put_nowait({"type": "final_user_request", "content": txt})
@@ -880,7 +888,7 @@ Examples:
   python server.py --help
   python server.py --tts-engine coqui --llm-provider ollama --llm-base-url http://localhost:8080 --llm-model gemma-3n-E4B-it-UD-Q4_K_XL.gguf
   python server.py --tts-engine orpheus --llm-provider lmstudio --llm-base-url http://localhost:1234 --llm-model Qwen3-30B-A3B-GGUF/Qwen3-30B-A3B-Q3_K_L.gguf
-  python server.py --tts-engine kokoro --llm-provider openai --llm-base-url https://api.openai.com/v1 --llm-model gpt-4o-mini
+  python server.py --tts-engine kokoro --llm-provider openai --llm-base-url "https://openrouter.ai/api/v1" --llm-model "mistralai/mistral-nemo" --llm-api-key "..."
 
 Available TTS Engines:
   coqui    - Coqui TTS engine (default)
@@ -890,8 +898,7 @@ Available TTS Engines:
 Available LLM Providers:
   ollama   - Local Ollama instance
   lmstudio - Local LM Studio instance
-  openai   - OpenAI API
-  anthropic- Anthropic Claude API
+  openai   - OpenAI API (compatible with OpenRouter, etc.)
         """
     )
     
@@ -899,28 +906,42 @@ Available LLM Providers:
                         choices=["coqui", "orpheus", "kokoro"],
                         help="TTS engine to use (default: coqui)")
     parser.add_argument("--llm-provider", type=str, default="ollama",
-                        choices=["ollama", "lmstudio", "openai", "anthropic"],
+                        choices=["ollama", "lmstudio", "openai"],
                         help="LLM provider to use (default: ollama)")
-    parser.add_argument("--llm-base-url", type=str, default="http://192.168.64.164:8080",
-                        help="Base URL for LLM API (default: http://192.168.64.164:8080)")
+    parser.add_argument("--llm-base-url", type=str, default="http://127.0.0.1:11434",
+                        help="Base URL for LLM API (default: http://127.0.0.1:11434)")
     parser.add_argument("--llm-model", type=str, default="gemma-3n-E4B-it-UD-Q4_K_XL.gguf",
                         help="LLM model to use (default: gemma-3n-E4B-it-UD-Q4_K_XL.gguf)")
+    parser.add_argument("--llm-api-key", type=str, default=None,
+                        help="API key for cloud LLM providers like OpenAI (can also use LLM_API_KEY env var)")
     
     args = parser.parse_args()
     
-    # Update configuration variables from parsed arguments
-    TTS_START_ENGINE = args.tts_engine
-    LLM_START_PROVIDER = args.llm_provider
-    LLM_BASE_URL = args.llm_base_url
-    LLM_START_MODEL = args.llm_model
-    DIRECT_STREAM = TTS_START_ENGINE == "orpheus"
-    
-    # Log configuration
-    logger.info(f"🖥️⚙️ {Colors.apply('[CONFIG]').blue} TTS Engine: {Colors.apply(TTS_START_ENGINE).blue}")
-    logger.info(f"🖥️⚙️ {Colors.apply('[CONFIG]').blue} LLM Provider: {Colors.apply(LLM_START_PROVIDER).blue}")
-    logger.info(f"🖥️⚙️ {Colors.apply('[CONFIG]').blue} LLM Base URL: {Colors.apply(LLM_BASE_URL).blue}")
-    logger.info(f"🖥️⚙️ {Colors.apply('[CONFIG]').blue} LLM Model: {Colors.apply(LLM_START_MODEL).blue}")
-    logger.info(f"🖥️⚙️ {Colors.apply('[CONFIG]').blue} Direct streaming: {Colors.apply('ON' if DIRECT_STREAM else 'OFF').blue}")
+    # Set environment variables from parsed arguments so Uvicorn worker can access them
+    os.environ["TTS_START_ENGINE"] = args.tts_engine
+    os.environ["LLM_START_PROVIDER"] = args.llm_provider
+    os.environ["LLM_BASE_URL"] = args.llm_base_url
+    os.environ["LLM_START_MODEL"] = args.llm_model
+    if args.llm_api_key:
+        os.environ["LLM_API_KEY"] = args.llm_api_key
+    elif "LLM_API_KEY" in os.environ:
+        # If the key is already in the environment, make sure it's available to the app
+        pass
+
+    # Log the configuration that will be used
+    logger.info(f"🖥️⚙️ {Colors.apply('[MAIN CONFIG]').blue} TTS Engine: {Colors.apply(args.tts_engine).blue}")
+    logger.info(f"🖥️⚙️ {Colors.apply('[MAIN CONFIG]').blue} LLM Provider: {Colors.apply(args.llm_provider).blue}")
+    logger.info(f"🖥️⚙️ {Colors.apply('[MAIN CONFIG]').blue} LLM Base URL: {Colors.apply(args.llm_base_url).blue}")
+    logger.info(f"🖥️⚙️ {Colors.apply('[MAIN CONFIG]').blue} LLM Model: {Colors.apply(args.llm_model).blue}")
+    logger.info(f"🖥️⚙️ {Colors.apply('[MAIN CONFIG]').blue} LLM API Key is {'SET' if args.llm_api_key or os.getenv('LLM_API_KEY') else 'NOT SET'}")
+
+    # Validate API key for cloud providers
+    cloud_providers = ["openai"]
+    if args.llm_provider in cloud_providers:
+        if not (args.llm_api_key or os.getenv("LLM_API_KEY")):
+            logger.error(f"🖥️💥 API key required for {args.llm_provider}")
+            logger.error("🖥️💥 Please provide --llm-api-key argument or set LLM_API_KEY environment variable")
+            sys.exit(1)
 
     # Run the server without SSL
     if not USE_SSL:
