@@ -85,26 +85,16 @@ def _create_openai_client(api_key: Optional[str], base_url: Optional[str] = None
         raise ImportError("openai library is required for this backend but not installed.")
     try:
         effective_key = api_key if api_key else "no-key-needed"
-        
-        # Added explicit logging to debug the exact values being used.
-        logger.info(f"🤖🔌 Creating OpenAI client with effective_key: '...{effective_key[-4:] if effective_key and len(effective_key) > 4 else 'KEY'}' and base_url: '{base_url}'")
-
+        client_args = {
+            "api_key": effective_key,
+            "timeout": 30.0,
+            "max_retries": 2
+        }
         if base_url:
-            client = OpenAI(
-                api_key=effective_key,
-                base_url=base_url,
-                timeout=30.0,
-                max_retries=2
-            )
-        else:
-            # If no base_url is provided, the client will use the default OpenAI URL.
-            client = OpenAI(
-                api_key=effective_key,
-                timeout=30.0,
-                max_retries=2
-            )
+            client_args["base_url"] = base_url
 
-        logger.info(f"🤖🔌 Prepared OpenAI-compatible client. Final client base_url: {client.base_url}")
+        client = OpenAI(**client_args)
+        logger.info(f"🤖🔌 Prepared OpenAI-compatible client (Base URL: {base_url or 'Default'}).")
         return client
     except Exception as e:
         logger.error(f"🤖💥 Failed to initialize OpenAI client: {e}")

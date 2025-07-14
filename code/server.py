@@ -107,12 +107,6 @@ async def lifespan(app: FastAPI):
     llm_start_model = os.getenv("LLM_START_MODEL", "gemma-3n-E4B-it-UD-Q4_K_XL.gguf")
     llm_api_key = os.getenv("LLM_API_KEY")
 
-    logger.info(f"🖥️⚙️ {Colors.apply('[LIFESPAN CONFIG]').blue} TTS Engine: {Colors.apply(tts_start_engine).blue}")
-    logger.info(f"🖥️⚙️ {Colors.apply('[LIFESPAN CONFIG]').blue} LLM Provider: {Colors.apply(llm_start_provider).blue}")
-    logger.info(f"🖥️⚙️ {Colors.apply('[LIFESPAN CONFIG]').blue} LLM Base URL: {Colors.apply(llm_base_url).blue}")
-    logger.info(f"🖥️⚙️ {Colors.apply('[LIFESPAN CONFIG]').blue} LLM Model: {Colors.apply(llm_start_model).blue}")
-    logger.info(f"🖥️⚙️ {Colors.apply('[LIFESPAN CONFIG]').blue} LLM API Key is {'SET' if llm_api_key else 'NOT SET'}")
-
     # Initialize global components, not connection-specific state
     app.state.SpeechPipelineManager = SpeechPipelineManager(
         tts_engine=tts_start_engine,
@@ -930,10 +924,6 @@ Available LLM Providers:
 
     # Log the configuration that will be used
     logger.info(f"🖥️⚙️ {Colors.apply('[MAIN CONFIG]').blue} TTS Engine: {Colors.apply(args.tts_engine).blue}")
-    logger.info(f"🖥️⚙️ {Colors.apply('[MAIN CONFIG]').blue} LLM Provider: {Colors.apply(args.llm_provider).blue}")
-    logger.info(f"🖥️⚙️ {Colors.apply('[MAIN CONFIG]').blue} LLM Base URL: {Colors.apply(args.llm_base_url).blue}")
-    logger.info(f"🖥️⚙️ {Colors.apply('[MAIN CONFIG]').blue} LLM Model: {Colors.apply(args.llm_model).blue}")
-    logger.info(f"🖥️⚙️ {Colors.apply('[MAIN CONFIG]').blue} LLM API Key is {'SET' if args.llm_api_key or os.getenv('LLM_API_KEY') else 'NOT SET'}")
 
     # Validate API key for cloud providers
     cloud_providers = ["openai"]
