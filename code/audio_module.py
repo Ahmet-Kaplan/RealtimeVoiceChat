@@ -25,7 +25,7 @@ ENGINE_SILENCES = {
     "orpheus": Silence(comma=0.3, sentence=0.6, default=0.3),
 }
 # Stream chunk sizes influence latency vs. throughput trade-offs
-QUICK_ANSWER_STREAM_CHUNK_SIZE = 8
+QUICK_ANSWER_STREAM_CHUNK_SIZE = 20
 FINAL_ANSWER_STREAM_CHUNK_SIZE = 30
 
 # Coqui model download helper functions
@@ -334,7 +334,7 @@ class AudioProcessor:
 
             if buffering:
                 # Check conditions to flush buffer and stop buffering
-                if good_streak >= 2 or buf_dur >= 0.5: # Flush if stable or buffer > 0.5s
+                if good_streak >= 2 or buf_dur >= 0.1: # Flush if stable or buffer > 0.5s
                     logger.info(f"👄➡️ {generation_string} Quick Flushing buffer (streak={good_streak}, dur={buf_dur:.2f}s).")
                     for c in buffer:
                         try:
@@ -509,7 +509,7 @@ class AudioProcessor:
             buffer.append(chunk)
             buf_dur += play_duration
             if buffering:
-                if good_streak >= 2 or buf_dur >= 0.5: # Same flush logic as synthesize
+                if good_streak >= 2 or buf_dur >= 0.1: # Same flush logic as synthesize
                     logger.info(f"👄➡️ {generation_string} Final Flushing buffer (streak={good_streak}, dur={buf_dur:.2f}s).")
                     for c in buffer:
                         try:
@@ -554,10 +554,10 @@ class AudioProcessor:
         )
 
         # Add Orpheus specific parameters for generator streaming
-        if self.engine_name == "orpheus":
+        #if self.engine_name == "orpheus":
             # These encourage waiting for more text before synthesizing, potentially better for generators
-            play_kwargs["minimum_sentence_length"] = 200
-            play_kwargs["minimum_first_fragment_length"] = 200
+        #    play_kwargs["minimum_sentence_length"] = 200
+        #    play_kwargs["minimum_first_fragment_length"] = 200
 
         logger.info(f"👄▶️ {generation_string} Final Starting synthesis from generator.")
         self.stream.play_async(**play_kwargs)
