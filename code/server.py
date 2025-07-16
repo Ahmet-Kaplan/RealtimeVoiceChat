@@ -925,14 +925,6 @@ Available LLM Providers:
     # Log the configuration that will be used
     logger.info(f"🖥️⚙️ {Colors.apply('[MAIN CONFIG]').blue} TTS Engine: {Colors.apply(args.tts_engine).blue}")
 
-    # Validate API key for cloud providers
-    cloud_providers = ["openai"]
-    if args.llm_provider in cloud_providers:
-        if not (args.llm_api_key or os.getenv("LLM_API_KEY")):
-            logger.error(f"🖥️💥 API key required for {args.llm_provider}")
-            logger.error("🖥️💥 Please provide --llm-api-key argument or set LLM_API_KEY environment variable")
-            sys.exit(1)
-
     # Run the server without SSL
     if not USE_SSL:
         logger.info("🖥️▶️ Starting server without SSL.")
