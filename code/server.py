@@ -643,7 +643,7 @@ class TranscriptionCallbacks:
         """
         logger.debug(f"🖥️🧠 Potential sentence: '{txt}'")
         # Access global manager state
-        self.app.state.SpeechPipelineManager.prepare_generation(txt)
+        # self.app.state.SpeechPipelineManager.prepare_generation(txt)
 
     def on_potential_final(self, txt: str):
         """
@@ -696,6 +696,7 @@ class TranscriptionCallbacks:
 
         # Add user request to history
         self.app.state.SpeechPipelineManager.history.append({"role": "user", "content": txt})
+        self.app.state.SpeechPipelineManager.prepare_generation(txt)
 
     def on_final(self, txt: str):
         """
