@@ -56,14 +56,16 @@ export class RunPodService {
       });
       
       const endpoints = response.data.data?.myself?.endpoints || [];
+
+      console.log('RunPod endpoints:', endpoints);
       
       // Update endpoints based on their names
       for (const endpoint of endpoints) {
-        if (endpoint.name === 'whisper-worker') {
+        if (endpoint.name === 'whisper') {
           this.whisperEndpointId = endpoint.id;
-        } else if (endpoint.name === 'llm-worker') {
+        } else if (endpoint.name === 'llm') {
           this.llmEndpointId = endpoint.id;
-        } else if (endpoint.name === 'tts-worker') {
+        } else if (endpoint.name === 'tts') {
           this.ttsEndpointId = endpoint.id;
         }
       }
@@ -207,6 +209,43 @@ export class RunPodService {
       return result.audio_base64;
     } catch (error) {
       console.error('Error synthesizing speech:', error);
+      throw error;
+    }
+  }
+  
+  /**
+   * New method for streaming TTS output
+   * Breaks text into sentences and generates audio for each one separately
+   */
+  public async streamSpeech(
+    input: TTSRequest, 
+    onChunkReady: (chunk: string) => void
+  ): Promise<void> {
+    try {
+      // Split text into sentences (simple split on punctuation)
+      const sentences = input.text
+        .replace(/([.!?])\s+/g, "$1|")
+        .split("|")
+        .filter(s => s.trim().length > 0);
+      
+      // Process each sentence in sequence
+      for (const sentence of sentences) {
+        // Skip if empty
+        if (!sentence.trim()) continue;
+        
+        const sentenceInput = {
+          ...input,
+          text: sentence
+        };
+        
+        // Generate audio for this sentence
+        const audioChunk = await this.synthesizeSpeech(sentenceInput);
+        
+        // Send the chunk back
+        onChunkReady(audioChunk);
+      }
+    } catch (error) {
+      console.error('Error streaming speech:', error);
       throw error;
     }
   }

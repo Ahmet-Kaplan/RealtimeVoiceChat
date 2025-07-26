@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useRef } from 'react';
 import { v4 as uuidv4 } from 'uuid';
-import { useChat, Message as AIMessage } from 'ai/react';
+import { useChat, Message as AIMessage } from '@ai-sdk/react';
 import { io, Socket } from 'socket.io-client';
 import dynamic from 'next/dynamic';
 import ChatMessages from '@/components/ChatMessages';
@@ -14,7 +14,7 @@ const AudioRecorder = dynamic(() => import('@/components/AudioRecorder'), {
 });
 
 // Backend service URL
-const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || 'https://your-railway-server.railway.app';
+const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL;
 
 export default function Home() {
   // State for session management
@@ -31,7 +31,7 @@ export default function Home() {
   const [endpointsReady, setEndpointsReady] = useState(false);
   
   // Using Vercel AI SDK useChat for chat functionality
-  const { messages, input, handleInputChange, handleSubmit, setMessages, isLoading } = useChat({
+  const { messages, input, handleInputChange, handleSubmit, setMessages, status } = useChat({
     api: '/api/chat',
     body: { sessionId },
     onResponse: (response) => {
@@ -129,21 +129,52 @@ export default function Home() {
     });
     
     newSocket.on('assistant_response', (data) => {
-      // Create a new message
-      const newMessage: AIMessage = {
-        id: uuidv4(),
-        role: 'assistant',
-        content: data.text,
-        createdAt: new Date()
-      };
-      
-      // Update messages with the new message
-      setMessages([...messages, newMessage]);
-      
-      // Play audio if available
-      if (data.audio) {
-        playAudio(`data:audio/mp3;base64,${data.audio}`);
+      if (!data.isComplete) {
+        // Initial response with just text
+        const newMessage: AIMessage = {
+          id: uuidv4(),
+          role: 'assistant',
+          content: data.text,
+          createdAt: new Date()
+        };
+        
+        // Update messages with the new response
+        setMessages((prevMessages) => {
+          // Check if this is an update to an existing message
+          const lastMessage = prevMessages[prevMessages.length - 1];
+          if (lastMessage && lastMessage.role === 'assistant') {
+            // Clone the messages array without the last message
+            const updatedMessages = prevMessages.slice(0, -1);
+            // Add the updated message
+            return [...updatedMessages, newMessage];
+          }
+          
+          // Otherwise add as a new message
+          return [...prevMessages, newMessage];
+        });
       }
+    });
+    
+    // Handle streaming audio chunks
+    newSocket.on('audio_chunk', (data) => {
+      // Play the audio chunk
+      playAudio(`data:audio/mp3;base64,${data.audio}`);
+    });
+    
+    // Handle speech detection status
+    newSocket.on('vad_status', (data) => {
+      if (data.speaking) {
+        // Visual feedback that speech is detected
+        console.log('Speech detected');
+        // You could update UI here to show speaking indicator
+      } else {
+        console.log('Speech ended');
+      }
+    });
+    
+    // Handle transcription status
+    newSocket.on('transcribing', (data) => {
+      setIsProcessing(data.inProgress);
     });
     
     newSocket.on('error', (error) => {
@@ -190,13 +221,30 @@ export default function Home() {
   
   // Function to play audio
   const playAudio = (audioSrc: string) => {
+    // For streaming audio, we want to queue chunks rather than interrupt
+    // Only stop current audio if it's finished or nearly finished
     if (currentAudio) {
-      currentAudio.pause();
+      const timeLeft = currentAudio.duration - currentAudio.currentTime;
+      if (timeLeft < 0.1 || isNaN(timeLeft)) {
+        currentAudio.pause();
+      } else {
+        // If there's significant time left, queue this audio chunk
+        const queuedAudio = new Audio(audioSrc);
+        currentAudio.onended = () => {
+          queuedAudio.play().catch(err => console.error('Error playing queued audio:', err));
+          setCurrentAudio(queuedAudio);
+        };
+        return;
+      }
     }
     
-    const audio = new Audio(audioSrc);
-    setCurrentAudio(audio);
-    audio.play();
+    try {
+      const audio = new Audio(audioSrc);
+      audio.play().catch(err => console.error('Error playing audio:', err));
+      setCurrentAudio(audio);
+    } catch (err) {
+      console.error('Error creating audio element:', err);
+    }
   };
   
   // Function to reset conversation
@@ -226,6 +274,21 @@ export default function Home() {
   const submitTextMessage = (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     handleSubmit(e);
+  };
+  
+  // Update the audio handling function to process audio chunks in real-time
+  const handleAudioChunk = (audioChunk: Float32Array, sampleRate: number) => {
+    if (!socket || !isConnected) return;
+    
+    // Convert Float32Array to regular array and send it to the server
+    const audioData = {
+      chunk: Array.from(audioChunk),
+      sampleRate: sampleRate,
+      sessionId: sessionId
+    };
+    
+    // Send audio chunk directly via socket.io
+    socket.emit('audio_chunk', audioData);
   };
   
   return (
@@ -267,11 +330,11 @@ export default function Home() {
                 onChange={handleInputChange}
                 placeholder="Type your message..."
                 className="flex-1 p-2 border border-gray-300 rounded"
-                disabled={isLoading || isProcessing}
+                disabled={status === 'streaming' || isProcessing}
               />
               <button
                 type="submit"
-                disabled={isLoading || isProcessing || !input.trim()}
+                disabled={status === 'streaming' || isProcessing || !input.trim()}
                 className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 transition-colors disabled:bg-gray-400"
               >
                 Send
@@ -280,10 +343,13 @@ export default function Home() {
           </form>
           
           {/* Voice input */}
-          <AudioRecorder 
-            onAudioCaptured={handleAudioCaptured} 
-            isProcessing={isLoading || isProcessing}
-          />
+          <div className="flex flex-col items-center justify-center space-y-6 mb-6">
+            <AudioRecorder 
+              onAudioChunk={handleAudioChunk}
+              isProcessing={isProcessing}
+              socketConnected={isConnected}
+            />
+          </div>
           
           <button
             onClick={resetConversation}

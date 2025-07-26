@@ -1,7 +1,7 @@
 import os
+from typing import Dict, List, Any, Optional
 import torch
-import numpy as np
-from typing import Dict, List, Optional, Union, Any
+import whisper
 from faster_whisper import WhisperModel
 
 class WhisperTranscriber:
@@ -12,11 +12,21 @@ class WhisperTranscriber:
         Args:
             model: The name of the Whisper model to use
         """
+        # Get GPU device from environment (useful for multi-GPU setups)
+        device_id = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.compute_type = "float16" if self.device == "cuda" else "float32"
         
-        print(f"Loading model {model} on {self.device}...")
-        self.model = WhisperModel(model, device=self.device, compute_type=self.compute_type)
+        # Get model path from environment variable or use default cache
+        model_path = os.environ.get("MODEL_PATH", None)
+        if model_path:
+            print(f"Using custom model path: {model_path}")
+            # If using custom path, ensure it exists
+            os.makedirs(model_path, exist_ok=True)
+            os.environ["WHISPER_CACHE"] = model_path
+        
+        print(f"Loading model {model} on {self.device} (device {device_id})...")
+        self.model = WhisperModel(model, device=self.device, compute_type=self.compute_type, download_root=model_path)
         print("Model loaded successfully")
     
     def transcribe(
@@ -25,7 +35,8 @@ class WhisperTranscriber:
         params: Dict[str, Any] = {},
         transcription_format: str = "plain_text",
         translation_format: Optional[str] = None,
-        vad_filter: bool = False
+        vad_filter: bool = False,
+        incremental: bool = False
     ) -> Dict[str, Any]:
         """
         Transcribe audio using Whisper
@@ -36,10 +47,29 @@ class WhisperTranscriber:
             transcription_format: Output format for transcription
             translation_format: Output format for translation
             vad_filter: Whether to use VAD filtering
+            incremental: Whether to return results incrementally during processing
             
         Returns:
             Dict containing transcription results
         """
+        # Set callback for incremental results if requested
+        incremental_callback = None
+        if incremental:
+            previous_text = ""
+            
+            def callback(segment):
+                nonlocal previous_text
+                # Get new text from this segment
+                new_text = segment.text
+                if new_text != previous_text:
+                    # Update previous text
+                    previous_text = new_text
+                    # Return the segment for the caller to use
+                    return segment
+                return None
+                
+            incremental_callback = callback
+            
         segments, info = self.model.transcribe(
             audio_path,
             language=params.get("language"),
@@ -57,7 +87,8 @@ class WhisperTranscriber:
             logprob_threshold=params.get("logprob_threshold", -1.0),
             no_speech_threshold=params.get("no_speech_threshold", 0.6),
             word_timestamps=params.get("word_timestamps", False),
-            vad_filter=vad_filter
+            vad_filter=vad_filter,
+            callback=incremental_callback if incremental else None
         )
         
         # Process the segments

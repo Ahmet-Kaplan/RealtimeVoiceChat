@@ -1,34 +1,45 @@
-FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+FROM python:3.10-slim
 
-# Set environment variables!
-ENV DEBIAN_FRONTEND=noninteractive
+# Add build argument for Hugging Face token
+ARG HUGGINGFACE_API_KEY
 
-# Install necessary packages
+# Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 \
-    python3-pip \
-    python3-dev \
     build-essential \
+    wget \
+    git \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
+# Install CUDA - but this would require a CUDA-enabled base image
+# For testing purposes, we'll continue without CUDA to check if runpod works
 
 # Set working directory
 WORKDIR /app
 
-# Install PyTorch and other dependencies
-RUN pip install --no-cache-dir torch==2.2.0 torchvision==0.17.0 torchaudio==2.2.0 --index-url https://download.pytorch.org/whl/cu121
+# Install RunPod first and verify installation
+RUN pip install --no-cache-dir runpod==1.6.0 && \
+    python -c "import runpod; print(f'RunPod version: {runpod.__version__}')"
 
-# Install Python dependencies
+# Install and configure Hugging Face CLI
+RUN pip install --no-cache-dir huggingface_hub && \
+    huggingface-cli login --token $HUGGINGFACE_API_KEY
+
+# Install other dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir --no-deps vllm==0.3.2 && \
-    pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application files
-COPY handler.py predict.py /app/
-COPY schema.py /app/
+COPY handler.py predict.py schema.py start.py /app/
+
+# Make start script executable
+RUN chmod +x /app/start.py
 
 # Expose port for API
 EXPOSE 8000
 
-# Start the service
-CMD ["python", "-m", "runpod.serverless.start"] 
+# Set environment variable to force module path recognition
+ENV PYTHONPATH=/app
+
+# Use our corrected start script
+CMD ["python", "/app/start.py"] 

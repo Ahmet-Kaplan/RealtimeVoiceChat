@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - '.github/workflows/deploy-runpod-serverless.yml'
+      - 'scripts/deploy_runpod.py'
     branches: [main]
   workflow_run:
     workflows: ["Build and Push Whisper Worker", "Build and Push TTS Worker", "Build and Push LLM Worker"]
@@ -14,15 +15,15 @@ on:
     inputs:
       whisper_image:
         description: 'Whisper Docker image to deploy'
-        required: true
+        required: false
         type: string
       tts_image:
         description: 'TTS Docker image to deploy'
-        required: true
+        required: false
         type: string
       llm_image:
         description: 'LLM Docker image to deploy'
-        required: true
+        required: false
         type: string
 
 jobs:
@@ -74,6 +75,7 @@ jobs:
           echo "LLM_ENDPOINT_ID=$LLM_ENDPOINT_ID" >> $GITHUB_ENV
         env:
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          HUGGINGFACE_API_KEY: ${{ secrets.HUGGINGFACE_API_KEY }}
           WHISPER_IMAGE: ${{ github.event.inputs.whisper_image || format('{0}/realtime-voice-whisper:latest', secrets.DOCKERHUB_USERNAME) }}
           TTS_IMAGE: ${{ github.event.inputs.tts_image || format('{0}/realtime-voice-tts:latest', secrets.DOCKERHUB_USERNAME) }}
           LLM_IMAGE: ${{ github.event.inputs.llm_image || format('{0}/realtime-voice-llm:latest', secrets.DOCKERHUB_USERNAME) }}

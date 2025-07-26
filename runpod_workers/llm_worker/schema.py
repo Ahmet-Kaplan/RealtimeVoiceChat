@@ -1,8 +1,9 @@
+# schema.py
 INPUT_SCHEMA = {
     "prompt": {
         "type": "string",
         "description": "Input text for the LLM to complete",
-        "required": True
+        "required": False
     },
     "messages": {
         "type": "array",
@@ -73,5 +74,11 @@ INPUT_SCHEMA = {
         "items": {
             "type": "string"
         }
+    },
+    "stream": {
+        "type": "boolean",
+        "description": "Whether to stream the response",
+        "required": False,
+        "default": False
     }
-} 
+}
